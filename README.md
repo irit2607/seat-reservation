@@ -24,6 +24,36 @@ npm run dev            # restarts on every file save
 Migrations in `migrations/` are applied automatically on startup (tracked in a
 `schema_migrations` table). `/ready` returns `503` until they have been applied.
 
+## Running the burst test
+One command, against a local or deployed instance:
+```bash
+npm run burst -- http://localhost:3000
+npm run burst -- https://your-app.onrender.com --requests 5000 --concurrency 200
+```
+Options: `--requests` (default `20000`), `--concurrency` in-flight requests
+(default `500`), `--hot-seats` (default `5`), `--contenders` per hot seat
+(default `500`).
+
+Against a fresh show, it runs:
+1. A hot-seat storm, with every contender for every hot seat firing at once.
+2. A general stampede skewed to "good" seats. Every 10th request is fired
+   together with a retry that uses the same key.
+3. Idempotency checks: simultaneous identical requests, the same key with
+   different seats, and reuse of a declined key.
+4. A per-user limit check under parallel requests.
+5. Identity checks: a spoofed body `user_id`, and one user cancelling another
+   user's reservation.
+6. Cancel, then rebook the released seat.
+
+A sampler checks `available + held + confirmed == total_seats` throughout the
+run. At the end, the final state is reconciled against every `201` the script
+saw (no seat in two `201`s, no user over the limit) and `/metrics` is reconciled
+against the API. It prints outcomes by status and by decline reason, plus
+p50/p95/p99 latency, and **exits `1` if any check fails**.
+
+Run it against a single instance that is already awake: the counter
+reconciliation assumes one process that didn't restart mid-run.
+
 ## Deploying (Render)
 `render.yaml` is a Render Blueprint for a free Docker web service plus a free
 Postgres 16 database, with `DATABASE_URL` wired in automatically. In the Render
