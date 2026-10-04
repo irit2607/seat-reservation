@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: seat-reservation
+    runtime: docker
+    plan: free
+    region: singapore
+    healthCheckPath: /health
+    envVars:
+      - key: LOG_LEVEL
+        value: info
