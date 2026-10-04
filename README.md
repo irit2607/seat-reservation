@@ -7,6 +7,28 @@ requests never book twice.
 Node.js + TypeScript + Express + PostgreSQL, deployed on Render. No ORM: plain
 `pg` queries, so the SQL that does the concurrency-safety work is visible.
 
+Design decisions, measured results and AI usage are in [`WRITEUP.md`](WRITEUP.md).
+
+## Live deployment
+- Service: https://seat-reservation-y5uw.onrender.com
+- Liveness: [`/health`](https://seat-reservation-y5uw.onrender.com/health)
+- Readiness (checks the database): [`/ready`](https://seat-reservation-y5uw.onrender.com/ready)
+- Metrics: [`/metrics`](https://seat-reservation-y5uw.onrender.com/metrics)
+- Logs: Render's free plan has no public log link.
+  [Screenshot of the live logs during a burst](docs/logs-under-load.jpg): the
+  burst script's output on the left, Render's live log tail on the right. Each
+  line is one request, with its `requestId`, `path`, `status` and `durationMs`.
+
+It runs on Render's free tier (0.1 CPU), which sleeps after 15 minutes idle;
+the first request wakes it, usually within a minute. Wake it before a burst:
+```bash
+curl https://seat-reservation-y5uw.onrender.com/ready
+npm run burst -- https://seat-reservation-y5uw.onrender.com --concurrency 300
+```
+That full 20k run takes about 7 minutes on this instance (about 45 reservations
+per second) and passed every check live. See "Deployment and measured capacity"
+in `WRITEUP.md` for what happens with much more load in flight at once.
+
 ## Running locally with Docker (easiest)
 ```bash
 docker compose up --build
