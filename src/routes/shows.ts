@@ -244,3 +244,67 @@ showsRouter.post('/shows/:id/reserve', authMiddleware, async (req, res) => {
     client.release();
   }
 });
+
+// ---------------------------------------------------------------------------
+// POST /reservations/:id/cancel - only the owner may cancel their own reservation
+// ---------------------------------------------------------------------------
+export const reservationsRouter = Router();
+
+reservationsRouter.post('/reservations/:id/cancel', authMiddleware, async (req, res) => {
+  const reservationId = req.params.id as string;
+  const userId = (req as any).userId as string;
+  if (!isUuid(reservationId)) {
+    return res.status(404).json({ error: 'reservation_not_found_or_not_cancellable' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Ownership and status are checked in the UPDATE's WHERE clause itself - the
+    // same atomic-guard principle as the seat claim. Two concurrent cancels of the
+    // same reservation serialize on this row, and only the first one matches.
+    const resUpdate = await client.query(
+      `UPDATE reservations
+       SET status = 'cancelled'
+       WHERE id = $1 AND user_id = $2 AND status = 'confirmed'
+       RETURNING show_id, seats`,
+      [reservationId, userId]
+    );
+
+    if (resUpdate.rowCount === 0) {
+      await client.query('ROLLBACK');
+      // Doesn't exist, isn't yours, or already cancelled: one answer for all three,
+      // so a caller can't probe which reservation ids belong to other users.
+      return res.status(404).json({ error: 'reservation_not_found_or_not_cancellable' });
+    }
+
+    const { show_id, seats } = resUpdate.rows[0];
+
+    // Lock order: reservation -> seats (stored sorted) -> user_show_counts, the same
+    // order reserve uses, so a cancel and a reserve never wait on each other in a cycle.
+    // Each release is guarded on reservation_id, so it only ever frees a seat that
+    // still belongs to this reservation.
+    for (const seatNumber of seats) {
+      await client.query(
+        `UPDATE seats SET status = 'available', reservation_id = NULL
+         WHERE show_id = $1 AND seat_number = $2 AND reservation_id = $3`,
+        [show_id, seatNumber, reservationId]
+      );
+    }
+
+    await client.query(
+      `UPDATE user_show_counts SET held_count = held_count - $3
+       WHERE user_id = $1 AND show_id = $2`,
+      [userId, show_id, seats.length]
+    );
+
+    await client.query('COMMIT');
+    res.status(200).json({ reservation_id: reservationId, status: 'cancelled' });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+});

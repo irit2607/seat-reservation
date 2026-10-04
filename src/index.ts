@@ -3,7 +3,7 @@ import express, { type NextFunction, type Request, type Response } from 'express
 import { requestIdMiddleware, logger } from './logger';
 import { checkDbReachable, isDbUnavailable, pool } from './db';
 import { runMigrations } from './migrate';
-import { showsRouter } from './routes/shows';
+import { showsRouter, reservationsRouter } from './routes/shows';
 
 let schemaReady = false;
 
@@ -31,6 +31,7 @@ app.get('/ready', async (_req, res) => {
 });
 
 app.use(showsRouter);
+app.use(reservationsRouter);
 
 app.use((_req, res) => {
   res.status(404).json({ error: 'not_found' });

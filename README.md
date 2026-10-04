@@ -75,6 +75,15 @@ retry never looks like a second booking), a decline replays as the same
 | `401` | Missing bearer token |
 | `404` | Unknown show |
 
+### `POST /reservations/:id/cancel` (requires `Authorization: Bearer <user_id>`)
+Only the reservation's owner can cancel it. Releases the seat(s) back to
+`available` and frees the user's per-show allowance, so they can book again.
+Returns `200 {"reservation_id": "...", "status": "cancelled"}`. `404` if the
+reservation doesn't exist, isn't yours, or is already cancelled (one answer for
+all three, so callers can't probe other users' reservation ids). Replaying the
+original reserve request's idempotency key afterwards returns the reservation
+with `status: "cancelled"`; it does not book again.
+
 ### `GET /health`
 Liveness only: `200` while the process is running.
 
@@ -90,5 +99,6 @@ Every response carries an `x-request-id` header. Send your own
   real JWT/session layer. The part that matters is that `user_id` never comes
   from the request body.
 - **Holds**: reservations confirm immediately rather than using a separate
-  hold-then-confirm step. `held` exists in the schema and the counts so the
-  invariant covers it, but nothing sets it.
+  hold-then-confirm step with expiry; seats are released by an explicit cancel.
+  `held` exists in the schema and the counts so the invariant covers it, but
+  nothing sets it.
