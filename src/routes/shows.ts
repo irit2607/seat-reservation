@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { pool } from '../db';
 import { authMiddleware } from '../auth';
 import { isUuid, validateCreateShow, validateReserve } from '../validation';
@@ -95,35 +95,89 @@ showsRouter.post('/shows/:id/reserve', authMiddleware, async (req, res) => {
   if (!isUuid(showId)) {
     return res.status(404).json({ error: 'show_not_found' });
   }
-  const parsed = validateReserve(req.body);
+  const parsed = validateReserve(req.body, req.get('idempotency-key'));
   if (!parsed.ok) {
     return res.status(400).json({ error: parsed.error });
   }
+  const { seats: requestedSeats, idempotencyKey } = parsed.value;
 
   // Shows are immutable once created, so this read can safely sit outside the transaction.
   const showRow = (await pool.query(`SELECT per_user_limit, price_paise FROM shows WHERE id = $1`, [showId])).rows[0];
   if (!showRow) {
     return res.status(404).json({ error: 'show_not_found' });
   }
-  if (parsed.value.seats.length > showRow.per_user_limit) {
-    return res.status(409).json({ error: 'per_user_limit_exceeded' });
-  }
 
-  // Lock order: seats (sorted) -> user_show_counts. Sorting means two overlapping
-  // multi-seat requests take their shared seat locks in the same order, so they
-  // can never deadlock waiting on each other.
-  const sortedSeats = [...parsed.value.seats].sort();
+  // Lock order: idempotency key -> seats (sorted) -> user_show_counts. Sorting means
+  // two overlapping multi-seat requests take their shared seat locks in the same
+  // order, so they can never deadlock waiting on each other.
+  const sortedSeats = [...requestedSeats].sort();
+  const requestHash = createHash('sha256')
+    .update(JSON.stringify({ showId, seats: sortedSeats }))
+    .digest('hex');
   const reservationId = randomUUID();
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
-    // All-or-nothing: a decline rolls back every seat and counter change made so far.
-    const decline = async (status: number, body: Record<string, unknown>) => {
+    // Idempotency: the key is claimed inside the reservation transaction and commits
+    // together with its outcome (a reservation or a stored decline). A concurrent
+    // request with the same key blocks on this INSERT until the first one commits,
+    // then replays whatever it recorded.
+    const claim = await client.query(
+      `INSERT INTO idempotency_keys (user_id, idempotency_key, request_hash, reservation_id)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (user_id, idempotency_key) DO NOTHING
+       RETURNING reservation_id`,
+      [userId, idempotencyKey, requestHash, reservationId]
+    );
+
+    if (claim.rowCount === 0) {
+      const existing = (await client.query(
+        `SELECT k.request_hash, k.response_status, k.response_body,
+                r.id, r.show_id, r.user_id, r.seats, r.amount_paise, r.status
+         FROM idempotency_keys k LEFT JOIN reservations r ON r.id = k.reservation_id
+         WHERE k.user_id = $1 AND k.idempotency_key = $2`,
+        [userId, idempotencyKey]
+      )).rows[0];
       await client.query('ROLLBACK');
+
+      if (existing.request_hash !== requestHash) {
+        return res.status(409).json({ error: 'idempotency_key_reused_with_different_body' });
+      }
+      res.setHeader('Idempotent-Replayed', 'true');
+      if (existing.response_status !== null) {
+        return res.status(existing.response_status).json(existing.response_body);
+      }
+      // 200, not 201: a replay must not look like a second successful booking.
+      return res.status(200).json({
+        reservation_id: existing.id,
+        show_id: existing.show_id,
+        user_id: existing.user_id,
+        seats: existing.seats,
+        amount_paise: existing.amount_paise,
+        status: existing.status,
+      });
+    }
+
+    // All-or-nothing: a decline rolls back to this savepoint, undoing every seat and
+    // counter change from this attempt, and commits only the key with its outcome.
+    await client.query('SAVEPOINT attempt');
+    const decline = async (status: number, body: Record<string, unknown>) => {
+      await client.query('ROLLBACK TO SAVEPOINT attempt');
+      await client.query(
+        `UPDATE idempotency_keys SET reservation_id = NULL, response_status = $3, response_body = $4
+         WHERE user_id = $1 AND idempotency_key = $2`,
+        [userId, idempotencyKey, status, body]
+      );
+      await client.query('COMMIT');
       res.status(status).json(body);
     };
+
+    if (sortedSeats.length > showRow.per_user_limit) {
+      await decline(409, { error: 'per_user_limit_exceeded' });
+      return;
+    }
 
     // THE atomic decision: claim each seat with a conditional UPDATE. Concurrent
     // UPDATEs on the same row are serialized by Postgres; once the winner commits,

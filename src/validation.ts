@@ -4,6 +4,7 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const MAX_SEATS_PER_SHOW = 10_000;
 const MAX_SEAT_LABEL_LENGTH = 32;
 const MAX_NAME_LENGTH = 200;
+const MAX_IDEMPOTENCY_KEY_LENGTH = 255;
 // Keeps price * seats far below Number.MAX_SAFE_INTEGER.
 const MAX_PRICE_PAISE = 1_000_000_000_000;
 const MAX_PER_USER_LIMIT = 100;
@@ -62,11 +63,25 @@ export function validateCreateShow(body: unknown): Result<CreateShowInput> {
 
 export interface ReserveInput {
   seats: string[];
+  idempotencyKey: string;
 }
 
-export function validateReserve(body: unknown): Result<ReserveInput> {
+// The key may come from the Idempotency-Key header or the body; if both are sent they must match.
+export function validateReserve(body: unknown, headerKey: string | undefined): Result<ReserveInput> {
   if (!isObject(body)) return { ok: false, error: 'body must be a JSON object' };
   const seatList = validateSeatList(body.seats, MAX_PER_USER_LIMIT);
   if (!seatList.ok) return seatList;
-  return { ok: true, value: { seats: seatList.value } };
+
+  const bodyKey = body.idempotency_key;
+  if (bodyKey !== undefined && typeof bodyKey !== 'string') {
+    return { ok: false, error: 'idempotency_key must be a string' };
+  }
+  if (headerKey !== undefined && bodyKey !== undefined && headerKey !== bodyKey) {
+    return { ok: false, error: 'Idempotency-Key header and idempotency_key body field differ' };
+  }
+  const key = bodyKey ?? headerKey;
+  if (!key || key.length > MAX_IDEMPOTENCY_KEY_LENGTH) {
+    return { ok: false, error: `idempotency_key is required (1-${MAX_IDEMPOTENCY_KEY_LENGTH} chars)` };
+  }
+  return { ok: true, value: { seats: seatList.value, idempotencyKey: key } };
 }

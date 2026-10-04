@@ -52,17 +52,26 @@ Returns `per_user_limit`, every seat's status, `counts: { available, held, confi
 
 ### `POST /shows/:id/reserve` (requires `Authorization: Bearer <user_id>`)
 ```json
-{ "seats": ["A12"] }
+{ "seats": ["A12"], "idempotency_key": "..." }
 ```
-Multi-seat requests are all-or-nothing.
+The key can also be sent as an `Idempotency-Key` header (if both are sent they
+must match). Keys are scoped per user. Multi-seat requests are all-or-nothing.
+
+Every outcome is stored against the key, declines included. A retry with the
+same key and body gets the original outcome back, with an
+`Idempotent-Replayed: true` header: a success replays as `200` (not `201`, so a
+retry never looks like a second booking), a decline replays as the same
+`409`/`422`. Clients that want to try again after a decline use a new key.
 
 | Status | Meaning |
 |---|---|
 | `201` | Reserved. Body: `reservation_id, show_id, user_id, seats, amount_paise, status` |
+| `200` | Replay of an earlier success with the same key |
 | `409 seat_unavailable` | A requested seat is already taken |
 | `409 per_user_limit_exceeded` | Would take the user over the show's limit |
+| `409 idempotency_key_reused_with_different_body` | Same key, different show or seats (whether the first attempt succeeded or was declined) |
 | `422 unknown_seat` | A requested seat label doesn't exist in this show |
-| `400` | Invalid body (empty or duplicate seats, malformed JSON) |
+| `400` | Invalid body (missing key, empty or duplicate seats, malformed JSON) |
 | `401` | Missing bearer token |
 | `404` | Unknown show |
 
