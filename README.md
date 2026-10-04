@@ -91,6 +91,23 @@ Liveness only: `200` while the process is running.
 Readiness: `503` until migrations are applied and whenever Postgres is not
 reachable within 2s.
 
+### `GET /metrics`
+Prometheus format:
+- `reservations_confirmed_total{show_id}`, `reservations_cancelled_total{show_id}`
+- `reservations_declined_total{show_id,reason}` — `seat_taken`, `unknown_seat`,
+  `per_user_limit`, `idempotent_replay`, `idempotency_key_reused`
+- `seats_available`, `seats_held`, `seats_confirmed`, `seats_total` `{show_id}`.
+  These are read from the database at scrape time (cached for 1s), so they
+  match `GET /shows/:id` and survive restarts.
+- `seat_metrics_up` — `0` when the database read behind the seat gauges fails.
+  The rest of `/metrics` keeps serving, and the seat series are absent rather
+  than stale.
+- `http_requests_total{method,route,status}`, `http_request_duration_seconds`
+- `db_pool_clients{state}` — `total`, `idle`, `waiting`
+- Node.js process metrics (CPU, memory, event loop lag, GC)
+
+Counters are per process and reset on restart, as Prometheus counters do.
+
 Every response carries an `x-request-id` header. Send your own
 `X-Request-Id` to have it echoed back and used in the logs.
 

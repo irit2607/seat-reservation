@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import { requestIdMiddleware, logger } from './logger';
+import { httpRequestDuration, httpRequests, registry } from './metrics';
 import { checkDbReachable, isDbUnavailable, pool } from './db';
 import { runMigrations } from './migrate';
 import { showsRouter, reservationsRouter } from './routes/shows';
@@ -11,6 +12,17 @@ const app = express();
 // Request id first, so requests rejected by the JSON parser are still logged.
 app.use(requestIdMiddleware);
 app.use(express.json({ limit: '1mb' }));
+
+// Route patterns (not raw paths) keep label cardinality bounded.
+app.use((req, res, next) => {
+  const stopTimer = httpRequestDuration.startTimer();
+  res.on('finish', () => {
+    const route = req.route ? req.baseUrl + req.route.path : 'unmatched';
+    httpRequests.inc({ method: req.method, route, status: String(res.statusCode) });
+    stopTimer({ method: req.method, route });
+  });
+  next();
+});
 
 // Liveness: is the process up at all? No dependency checks.
 app.get('/health', (_req, res) => {
@@ -28,6 +40,11 @@ app.get('/ready', async (_req, res) => {
     return res.status(503).json({ status: 'not_ready', db: 'unreachable' });
   }
   res.status(200).json({ status: 'ready', db: 'ok' });
+});
+
+app.get('/metrics', async (_req, res) => {
+  res.set('Content-Type', registry.contentType);
+  res.send(await registry.metrics());
 });
 
 app.use(showsRouter);

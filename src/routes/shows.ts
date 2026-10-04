@@ -2,9 +2,12 @@ import { Router } from 'express';
 import { createHash, randomUUID } from 'crypto';
 import { pool } from '../db';
 import { authMiddleware } from '../auth';
+import { reservationsCancelled, reservationsConfirmed, reservationsDeclined } from '../metrics';
 import { isUuid, validateCreateShow, validateReserve } from '../validation';
 
 export const showsRouter = Router();
+
+type DeclineReason = 'seat_taken' | 'unknown_seat' | 'per_user_limit';
 
 // ---------------------------------------------------------------------------
 // POST /shows  (admin) - create a show with every seat "available"
@@ -143,8 +146,10 @@ showsRouter.post('/shows/:id/reserve', authMiddleware, async (req, res) => {
       await client.query('ROLLBACK');
 
       if (existing.request_hash !== requestHash) {
+        reservationsDeclined.inc({ show_id: showId, reason: 'idempotency_key_reused' });
         return res.status(409).json({ error: 'idempotency_key_reused_with_different_body' });
       }
+      reservationsDeclined.inc({ show_id: showId, reason: 'idempotent_replay' });
       res.setHeader('Idempotent-Replayed', 'true');
       if (existing.response_status !== null) {
         return res.status(existing.response_status).json(existing.response_body);
@@ -163,7 +168,7 @@ showsRouter.post('/shows/:id/reserve', authMiddleware, async (req, res) => {
     // All-or-nothing: a decline rolls back to this savepoint, undoing every seat and
     // counter change from this attempt, and commits only the key with its outcome.
     await client.query('SAVEPOINT attempt');
-    const decline = async (status: number, body: Record<string, unknown>) => {
+    const decline = async (reason: DeclineReason, status: number, body: Record<string, unknown>) => {
       await client.query('ROLLBACK TO SAVEPOINT attempt');
       await client.query(
         `UPDATE idempotency_keys SET reservation_id = NULL, response_status = $3, response_body = $4
@@ -171,11 +176,12 @@ showsRouter.post('/shows/:id/reserve', authMiddleware, async (req, res) => {
         [userId, idempotencyKey, status, body]
       );
       await client.query('COMMIT');
+      reservationsDeclined.inc({ show_id: showId, reason });
       res.status(status).json(body);
     };
 
     if (sortedSeats.length > showRow.per_user_limit) {
-      await decline(409, { error: 'per_user_limit_exceeded' });
+      await decline('per_user_limit', 409, { error: 'per_user_limit_exceeded' });
       return;
     }
 
@@ -196,9 +202,9 @@ showsRouter.post('/shows/:id/reserve', authMiddleware, async (req, res) => {
           [showId, seatNumber]
         );
         if (exists.rowCount === 0) {
-          await decline(422, { error: 'unknown_seat', seat: seatNumber });
+          await decline('unknown_seat', 422, { error: 'unknown_seat', seat: seatNumber });
         } else {
-          await decline(409, { error: 'seat_unavailable', seat: seatNumber });
+          await decline('seat_taken', 409, { error: 'seat_unavailable', seat: seatNumber });
         }
         return;
       }
@@ -216,7 +222,7 @@ showsRouter.post('/shows/:id/reserve', authMiddleware, async (req, res) => {
       [userId, showId, sortedSeats.length, showRow.per_user_limit]
     );
     if (limitUpdate.rowCount === 0) {
-      await decline(409, { error: 'per_user_limit_exceeded' });
+      await decline('per_user_limit', 409, { error: 'per_user_limit_exceeded' });
       return;
     }
 
@@ -228,6 +234,7 @@ showsRouter.post('/shows/:id/reserve', authMiddleware, async (req, res) => {
     );
 
     await client.query('COMMIT');
+    reservationsConfirmed.inc({ show_id: showId });
 
     res.status(201).json({
       reservation_id: reservationId,
@@ -300,6 +307,7 @@ reservationsRouter.post('/reservations/:id/cancel', authMiddleware, async (req, 
     );
 
     await client.query('COMMIT');
+    reservationsCancelled.inc({ show_id });
     res.status(200).json({ reservation_id: reservationId, status: 'cancelled' });
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
