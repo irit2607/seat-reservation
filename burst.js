@@ -1,22 +1,12 @@
-// Usage: node burst.js <BASE_URL> [--requests 20000] [--concurrency 500] [--hot-seats 5] [--contenders 500]
-//
-// Reproduces an on-sale stampede against a fresh show and checks the correctness bar:
-//   1. hot-seat storm: many users fire at the same few seats simultaneously
-//   2. general stampede, skewed to "good" seats, with concurrent same-key retries
-//   3. idempotency: simultaneous replays, same key + different body, reused declined key
-//   4. per-user limit under parallel requests
-//   5. identity: spoofed body user_id, cancelling someone else's reservation
-//   6. cancel + rebook
-// A sampler checks available + held + confirmed == total_seats throughout, and the
-// final state is reconciled against every 201 we saw and against /metrics.
-// Prints the outcome distribution and exits 1 if any check fails.
+// Usage: node burst.js <BASE_URL> [--requests 20000] [--concurrency 500] [--hot-seats 5] [--contenders N]
+// --contenders defaults to requests / 8 / hot-seats, capped at 500 (so 500 at the default 20k).
 
 const args = parseArgs(process.argv.slice(2));
 const BASE_URL = (args._[0] || 'http://localhost:3000').replace(/\/$/, '');
 const REQUESTS = Number(args.requests ?? 20000);
 const CONCURRENCY = Number(args.concurrency ?? 500);
 const HOT_SEATS = Number(args['hot-seats'] ?? 5);
-const CONTENDERS = Number(args.contenders ?? 500);
+const CONTENDERS = Number(args.contenders ?? Math.max(20, Math.min(500, Math.floor(REQUESTS / 8 / HOT_SEATS))));
 const PER_USER_LIMIT = 4;
 const LIMIT_TEST_USERS = 10;
 // Idempotency keys and user ids are prefixed per run so re-runs never collide.
@@ -57,7 +47,13 @@ async function api(method, path, { token, body } = {}) {
     const text = await res.text();
     let json = null;
     try { json = JSON.parse(text); } catch {}
-    return { status: res.status, body: json, replayed: res.headers.get('idempotent-replayed') === 'true', ms: performance.now() - started };
+    return {
+      status: res.status,
+      body: json,
+      text: text.replace(/\s+/g, ' ').slice(0, 120),
+      replayed: res.headers.get('idempotent-replayed') === 'true',
+      ms: performance.now() - started,
+    };
   } catch (err) {
     return { status: 0, body: null, replayed: false, ms: performance.now() - started, error: err.cause?.code ?? err.name };
   }
@@ -65,7 +61,9 @@ async function api(method, path, { token, body } = {}) {
 
 // ---- outcome bookkeeping -------------------------------------------------------
 
-const stats = { byStatus: {}, byOutcome: {}, latencies: [] };
+// 5xx with a JSON error body came from the app; anything else (e.g. an HTML 502)
+// came from a proxy or load balancer in front of it.
+const stats = { byStatus: {}, byOutcome: {}, latencies: [], appErrors: 0, proxyErrors: 0, proxyErrorSample: '' };
 const ledger = new Map(); // seat -> reservation_id, from every 201 we received
 const userSeats = new Map(); // user -> seats currently confirmed to them
 const doubleSold = [];
@@ -85,6 +83,14 @@ async function reserve(showId, user, seats, key) {
   const outcome = outcomeOf(r);
   stats.byOutcome[outcome] = (stats.byOutcome[outcome] || 0) + 1;
   stats.latencies.push(r.ms);
+  if (outcome === 'server_error') {
+    if (r.body?.error) {
+      stats.appErrors++;
+    } else {
+      stats.proxyErrors++;
+      stats.proxyErrorSample ||= `${r.status} after ${(r.ms / 1000).toFixed(1)}s: ${r.text}`;
+    }
+  }
   if (outcome === 'confirmed') {
     activeReservations++;
     for (const seat of r.body.seats) {
@@ -181,18 +187,20 @@ async function main() {
   const sampler = startSampler(showId);
   const t0 = performance.now();
 
-  // 1. Hot-seat storm: every contender for every hot seat fires at once.
-  console.log(`--- 1. Hot-seat storm: ${CONTENDERS} users x ${HOT_SEATS} seats, all simultaneous`);
-  const storm = await Promise.all(hotSeats.flatMap((seat) =>
-    Array.from({ length: CONTENDERS }, (_, i) =>
-      reserve(showId, `${RUN_ID}-hot-${seat}-${i}`, [seat], `${RUN_ID}-hot-${seat}-${i}`).then((r) => ({ seat, r })))
-  ));
+  console.log(`--- 1. Hot-seat storm: ${HOT_SEATS} seats in turn, ${CONTENDERS} simultaneous users each`);
+  const storm = [];
+  for (const seat of hotSeats) {
+    const results = await Promise.all(Array.from({ length: CONTENDERS }, (_, i) =>
+      reserve(showId, `${RUN_ID}-hot-${seat}-${i}`, [seat], `${RUN_ID}-hot-${seat}-${i}`)));
+    storm.push(...results.map((r) => ({ seat, r })));
+  }
   const winners = hotSeats.map((seat) => storm.filter((x) => x.seat === seat && x.r.status === 201).length);
   const stormLosers = storm.filter((x) => x.r.status !== 201);
+  const loserStatuses = stormLosers.reduce((m, x) => ((m[x.r.status] = (m[x.r.status] || 0) + 1), m), {});
   check('exactly one 201 per hot seat', winners.every((w) => w === 1), `winners per seat: ${winners.join(',')}`);
   check('every hot-seat loser got a clean 409 seat_unavailable',
     stormLosers.every((x) => x.r.status === 409 && x.r.body?.error === 'seat_unavailable'),
-    `${stormLosers.length} losers`);
+    `${stormLosers.length} losers by status: ${JSON.stringify(loserStatuses)}`);
 
   // 2. General stampede, skewed to the first 10% of seats; every 10th task fires an
   //    original request and its retry (same user, seats and key) at the same moment.
@@ -303,7 +311,8 @@ async function main() {
   const overLimit = [...userSeats.values()].filter((n) => n > PER_USER_LIMIT).length;
   check(`no user holds more than ${PER_USER_LIMIT} seats`, overLimit === 0, `${userSeats.size} users with seats`);
   const serverErrors = Object.entries(stats.byStatus).filter(([s]) => Number(s) >= 500).reduce((n, [, c]) => n + c, 0);
-  check('zero 5xx', serverErrors === 0, `${serverErrors} server errors`);
+  check('zero 5xx', serverErrors === 0,
+    `${serverErrors} server errors: ${stats.appErrors} from the app, ${stats.proxyErrors} from a proxy in front of it`);
   check('zero network errors / timeouts', !stats.byOutcome.network_error, `${stats.byOutcome.network_error || 0}`);
 
   console.log('\n--- Metrics reconciliation (assumes a single instance that did not restart mid-run)');
@@ -330,6 +339,10 @@ async function main() {
   console.log(`  by HTTP status: ${JSON.stringify(stats.byStatus)}`);
   console.log(`  by outcome:     ${JSON.stringify(stats.byOutcome)}`);
   console.log(`  latency ms:     p50 ${percentile(sorted, 50).toFixed(0)}  p95 ${percentile(sorted, 95).toFixed(0)}  p99 ${percentile(sorted, 99).toFixed(0)}  max ${(sorted.at(-1) ?? 0).toFixed(0)}`);
+  if (stats.proxyErrors > 0) {
+    console.log(`  proxy 5xx sample: ${stats.proxyErrorSample}`);
+    console.log('  (non-JSON 5xx never reached the app: usually the host\'s load balancer giving up on a request queued too long)');
+  }
 
   const failed = checks.filter((c) => !c.ok);
   console.log(`\nRESULT: ${failed.length === 0 ? 'PASS' : 'FAIL'} (${checks.length - failed.length}/${checks.length} checks passed)`);

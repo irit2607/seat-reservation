@@ -32,10 +32,10 @@ npm run burst -- https://your-app.onrender.com --requests 5000 --concurrency 200
 ```
 Options: `--requests` (default `20000`), `--concurrency` in-flight requests
 (default `500`), `--hot-seats` (default `5`), `--contenders` per hot seat
-(default `500`).
+(default `requests / 8 / hot-seats`, capped at `500`, so `500` at 20k).
 
 Against a fresh show, it runs:
-1. A hot-seat storm, with every contender for every hot seat firing at once.
+1. A hot-seat storm: for each hot seat in turn, all its contenders fire at once.
 2. A general stampede skewed to "good" seats. Every 10th request is fired
    together with a retry that uses the same key.
 3. Idempotency checks: simultaneous identical requests, the same key with
@@ -52,7 +52,10 @@ against the API. It prints outcomes by status and by decline reason, plus
 p50/p95/p99 latency, and **exits `1` if any check fails**.
 
 Run it against a single instance that is already awake: the counter
-reconciliation assumes one process that didn't restart mid-run.
+reconciliation assumes one process that didn't restart mid-run. Any 5xx is
+reported as either from the app (JSON body) or from a proxy in front of it
+(non-JSON body, such as a load balancer's `502` when requests queue too long on
+a small instance).
 
 ## Deploying (Render)
 `render.yaml` is a Render Blueprint for a free Docker web service plus a free
